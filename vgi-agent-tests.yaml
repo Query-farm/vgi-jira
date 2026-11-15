@@ -1,0 +1,76 @@
+# Private graders for the public vgi.agent_test_tasks in the worker's catalog metadata.
+# `vgi-lint lint --ai` runs an agent on each prompt and grades it (VGI920).
+#
+# Every jira function needs an `atlassian` secret pointing at a site (the offline replay
+# server in test/mock_api/server.py works: SITE_URL 'http://127.0.0.1:<port>/cloud',
+# EMAIL 'ada@example.com', API_TOKEN 'cloud-token'). The fixture data is static, so the
+# tasks compare against reference queries.
+tasks:
+  - name: open_bugs_eng
+    reference_sql: >-
+      SELECT key, title FROM jira.main.issues()
+      WHERE project_key = 'ENG' AND issue_type = 'Bug' AND state = 'open' ORDER BY key
+  - name: issues_per_status
+    reference_sql: >-
+      SELECT status_category, count(*) AS issues FROM jira.main.issues() GROUP BY status_category ORDER BY status_category
+  - name: ada_assigned
+    reference_sql: >-
+      SELECT key, status FROM jira.main.issues() WHERE assignee_display_name = 'Ada Lovelace' ORDER BY key
+  - name: status_transitions
+    reference_sql: >-
+      SELECT changed_at, from_string, to_string, author_display_name
+      FROM jira.main.issue_changelog(issue_key := 'ENG-1') WHERE field = 'status' ORDER BY changed_at
+  - name: active_sprint
+    reference_sql: >-
+      SELECT s.name FROM jira.main.sprints() s JOIN jira.main.boards b ON b.id = s.board_id
+      WHERE b.project_key = 'ENG' AND b.type = 'scrum' AND s.state = 'active'
+  - name: sprint_issues
+    check_sql: >-
+      SELECT count(*) = 3 AND count(*) FILTER (WHERE state = 'closed') = 1
+      FROM jira.main.issues() WHERE list_contains(sprint_ids, 2)
+  - name: label_count
+    reference_sql: SELECT count(*) AS issues FROM jira.main.issues() WHERE list_contains(labels, 'backend')
+  - name: eng_components
+    reference_sql: >-
+      SELECT name, lead_display_name FROM jira.main.components(project_key := 'ENG') ORDER BY name
+  - name: time_logged
+    reference_sql: >-
+      SELECT sum(time_spent_seconds) / 3600.0 AS hours FROM jira.main.issue_worklogs(issue_key := 'ENG-2')
+  - name: custom_fields
+    reference_sql: SELECT name, schema_type FROM jira.main.fields WHERE is_custom ORDER BY name
+  - name: confluence_spaces
+    reference_sql: SELECT key, name FROM jira.confluence.spaces ORDER BY key
+  - name: runbook_pages
+    reference_sql: >-
+      SELECT title FROM jira.confluence.pages() WHERE space_key = 'OPS' AND list_contains(labels, 'runbook') ORDER BY title
+  - name: restricted_comments
+    reference_sql: >-
+      SELECT issue_key, id, visibility FROM jira.main.issue_comments() WHERE visibility IS NOT NULL ORDER BY issue_key, id
+  - name: blockers
+    reference_sql: >-
+      SELECT issue_key, linked_issue_key FROM jira.main.issue_links() WHERE relationship = 'blocks' ORDER BY issue_key
+  - name: subtask_types
+    reference_sql: SELECT name FROM jira.main.issue_types WHERE is_subtask ORDER BY name
+  - name: highest_priority
+    reference_sql: SELECT name FROM jira.main.priorities WHERE name = 'Highest'
+  - name: bug_workflow
+    reference_sql: >-
+      SELECT status FROM jira.main.project_statuses(project_key := 'ENG') WHERE issue_type = 'Bug' ORDER BY status
+  - name: project_leads
+    reference_sql: SELECT key, lead_display_name FROM jira.main.projects ORDER BY key
+  - name: done_statuses
+    reference_sql: SELECT name FROM jira.main.statuses WHERE status_category_key = 'done' ORDER BY name
+  - name: inactive_users
+    reference_sql: SELECT display_name FROM jira.main.users WHERE NOT active ORDER BY display_name
+  - name: unreleased_versions
+    reference_sql: >-
+      SELECT name, release_date FROM jira.main.versions(project_key := 'ENG') WHERE NOT released ORDER BY name
+  - name: page_editors
+    reference_sql: >-
+      SELECT number, author_id FROM jira.confluence.page_versions(page_id := '1001') ORDER BY number
+  - name: page_tags
+    reference_sql: SELECT name FROM jira.confluence.page_labels(page_id := '1012') ORDER BY name
+  - name: open_inline_comments
+    reference_sql: >-
+      SELECT id, inline_selection, body_text FROM jira.confluence.page_comments(page_id := '1001')
+      WHERE kind = 'inline' AND resolution_status = 'open' ORDER BY id

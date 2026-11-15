@@ -1,0 +1,817 @@
+# name: test/sql/jira.test
+# description: SQL tests for the jira worker against the offline Atlassian replay server (test/mock_api/server.py)
+# group: [jira]
+
+require vgi
+
+require-env JIRA_WORKER
+
+require-env JIRA_FIXTURE_URL
+
+# httpfs + json read the replay server's /__requests log to assert what was pushed down.
+statement ok
+LOAD httpfs;
+
+statement ok
+LOAD json;
+
+# No ICU in the test runner: TIMESTAMPTZ values print in UTC.
+statement ok
+ATTACH 'jira' (TYPE vgi, LOCATION '{JIRA_WORKER}');
+
+# ---------------------------------------------------------------- secret errors
+
+statement error
+SELECT count(*) FROM jira.main.issues();
+----
+<REGEX>:.*no atlassian secret.*
+
+statement ok
+CREATE SECRET bad_token (TYPE atlassian, SITE_URL '{JIRA_FIXTURE_URL}/cloud', EMAIL 'ada@example.com', API_TOKEN 'wrong');
+
+statement error
+SELECT count(*) FROM jira.main.issues();
+----
+<REGEX>:.*HTTP 401.*
+
+statement ok
+DROP SECRET bad_token;
+
+statement ok
+CREATE SECRET insecure (TYPE atlassian, SITE_URL 'http://acme.atlassian.net', EMAIL 'a@b.c', API_TOKEN 'x');
+
+statement error
+SELECT count(*) FROM jira.main.statuses;
+----
+<REGEX>:.*must use https.*
+
+statement ok
+DROP SECRET insecure;
+
+statement ok
+CREATE SECRET no_cred (TYPE atlassian, SITE_URL '{JIRA_FIXTURE_URL}/cloud', EMAIL 'ada@example.com');
+
+statement error
+SELECT count(*) FROM jira.main.statuses;
+----
+<REGEX>:.*EMAIL \+ API_TOKEN.*
+
+statement ok
+DROP SECRET no_cred;
+
+# The API token is redacted in duckdb_secrets().
+statement ok
+CREATE SECRET cloud (TYPE atlassian, SITE_URL '{JIRA_FIXTURE_URL}/cloud', EMAIL 'ada@example.com', API_TOKEN 'cloud-token');
+
+query I
+SELECT secret_string LIKE '%cloud-token%' FROM duckdb_secrets() WHERE name = 'cloud';
+----
+false
+
+# ======================================================================= Jira Cloud
+
+query TTTTTT
+SELECT key, title, state, status, assignee, labels FROM jira.main.issues() ORDER BY key;
+----
+ENG-1	Search revamp	open	In Progress	acc-ada	[search]
+ENG-2	Index documents	closed	Done	acc-ada	[backend, search]
+ENG-3	Crash on empty query	open	In Review	acc-grace	[backend]
+ENG-4	Search UI	open	To Do	NULL	[frontend]
+ENG-5	Typo in "Settings" page	closed	Done	acc-linus	[]
+ENG-6	Add regression test	open	In Progress	acc-ada	[]
+ENG-7	Upgrade dependencies	open	To Do	acc-grace	[backend, chore]
+OPS-1	Rotate certificates	closed	Done	acc-grace	[]
+OPS-2	Investigate 'disk full' alerts	open	In Progress	acc-ada	[incident]
+OPS-3	Onboard new hire	open	To Do	NULL	[]
+
+# An unfiltered scan still sends a bounded JQL (enhanced search rejects unbounded ones),
+# and only the projected fields (plus key) are requested.
+query TT
+SELECT query::JSON->>'jql', query::JSON->>'fields' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/search/jql') ORDER BY seq DESC LIMIT 1;
+----
+created >= "1970-01-01" ORDER BY key ASC	key,summary,status,assignee,labels
+
+# Typed columns and the tracker-neutral ones.
+query TITTTTTTTTT
+SELECT repo, number, id::VARCHAR, project_name, issue_type, is_subtask, priority, resolution, user_login, reporter_display_name, assignee_display_name FROM jira.main.issues() WHERE key = 'ENG-2';
+----
+ENG	2	10002	Engineering	Story	false	High	Done	acc-grace	Grace Hopper	Ada Lovelace
+
+query TTTTTTTT
+SELECT assignees, components, fix_versions, parent_key, parent_summary, sprint_ids, sprint_names, due_date FROM jira.main.issues() WHERE key IN ('ENG-2', 'ENG-3') ORDER BY key;
+----
+[acc-ada]	[Backend]	[1.0]	ENG-1	Search revamp	[1, 2]	[ENG Sprint 1, ENG Sprint 2]	NULL
+[acc-grace]	[Backend]	[]	NULL	NULL	[2]	[ENG Sprint 2]	2026-11-20
+
+query IIIIITTT
+SELECT original_estimate_seconds, remaining_estimate_seconds, time_spent_seconds, votes, watches, created_at, updated_at, closed_at FROM jira.main.issues() WHERE key = 'ENG-2';
+----
+43200	7200	36000	2	3	2026-09-10 09:00:00+00	2026-10-10 16:30:00+00	2026-10-10 16:30:00+00
+
+query TT
+SELECT body, html_url = '{JIRA_FIXTURE_URL}/cloud/browse/ENG-3' FROM jira.main.issues() WHERE key = 'ENG-3';
+----
+Steps: search for @Ada Lovelace with nothing.	true
+
+# ADF lists and marks flatten to text; the raw ADF stays available as JSON.
+query TT
+SELECT replace(body, chr(10), ' | '), description_adf->>'$.content[1].type' FROM jira.main.issues() WHERE key = 'ENG-1';
+----
+Replace the legacy search with Elastic. | - indexing | - query UI	bulletList
+
+# ---------------------------------------------------------------- JQL pushdown
+
+query T
+SELECT key FROM jira.main.issues() WHERE project_key = 'ENG' AND state = 'open' AND list_contains(labels, 'backend') ORDER BY key;
+----
+ENG-3
+ENG-7
+
+query TT
+SELECT query::JSON->>'jql', query::JSON->>'fields' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/search/jql') ORDER BY seq DESC LIMIT 1;
+----
+project = "ENG" AND statusCategory != Done AND labels = "backend" ORDER BY key ASC	key,project,status,labels
+
+query T
+SELECT key FROM jira.main.issues() WHERE state = 'closed' ORDER BY key;
+----
+ENG-2
+ENG-5
+OPS-1
+
+query T
+SELECT query::JSON->>'jql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/search/jql') ORDER BY seq DESC LIMIT 1;
+----
+statusCategory = Done ORDER BY key ASC
+
+# IN lists, IS NULL → is EMPTY, and a widened time range (re-checked exactly).
+query T
+SELECT key FROM jira.main.issues() WHERE issue_type IN ('Bug', 'Story') AND created_at >= TIMESTAMPTZ '2026-10-02 08:15:00+00' AND assignee IS NULL;
+----
+ENG-4
+
+query T
+SELECT query::JSON->>'jql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/search/jql') ORDER BY seq DESC LIMIT 1;
+----
+issuetype in ("Bug", "Story") AND created >= "2026-10-01 06:15" AND assignee is EMPTY ORDER BY key ASC
+
+# The widened JQL range let ENG-3 (created exactly at the bound) and ENG-2 through
+# the server; the SDK re-applies the exact SQL predicate.
+query T
+SELECT key FROM jira.main.issues() WHERE created_at > TIMESTAMPTZ '2026-10-02 08:15:00+00' AND project_key = 'ENG' AND issue_type = 'Bug' ORDER BY key;
+----
+ENG-5
+
+query T
+SELECT key FROM jira.main.issues() WHERE assignee = 'acc-ada' AND priority = 'High' AND status_category = 'In Progress' ORDER BY key;
+----
+ENG-1
+OPS-2
+
+query T
+SELECT query::JSON->>'jql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/search/jql') ORDER BY seq DESC LIMIT 1;
+----
+assignee = "acc-ada" AND priority = "High" AND statusCategory = "In Progress" ORDER BY key ASC
+
+# key IN, reporter (user_login), resolution IS NULL, sub-task types.
+query T
+SELECT key FROM jira.main.issues() WHERE key IN ('ENG-3', 'ENG-6', 'OPS-1') AND resolution IS NULL ORDER BY key;
+----
+ENG-3
+ENG-6
+
+query T
+SELECT query::JSON->>'jql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/search/jql') ORDER BY seq DESC LIMIT 1;
+----
+key in ("ENG-3", "ENG-6", "OPS-1") AND resolution is EMPTY ORDER BY key ASC
+
+query T
+SELECT key FROM jira.main.issues() WHERE is_subtask;
+----
+ENG-6
+
+query T
+SELECT key FROM jira.main.issues() WHERE user_login = 'acc-bot';
+----
+OPS-2
+
+query T
+SELECT query::JSON->>'jql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/search/jql') ORDER BY seq DESC LIMIT 1;
+----
+reporter = "acc-bot" ORDER BY key ASC
+
+# Parent (Cloud), sprint (list_contains on sprint_ids), components, fix versions.
+query T
+SELECT key FROM jira.main.issues() WHERE parent_key = 'ENG-1' ORDER BY key;
+----
+ENG-2
+ENG-4
+
+query I
+SELECT count(*) FROM jira.main.issues() WHERE list_contains(sprint_ids, 2);
+----
+3
+
+query T
+SELECT query::JSON->>'jql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/search/jql') ORDER BY seq DESC LIMIT 1;
+----
+sprint = 2 ORDER BY key ASC
+
+query T
+SELECT key FROM jira.main.issues() WHERE list_contains(components, 'Backend') AND list_contains(fix_versions, '1.0');
+----
+ENG-2
+
+# Values with quotes are escaped, not injected.
+query T
+SELECT key FROM jira.main.issues() WHERE status = 'Done' AND project_key = 'ENG' AND resolution = 'Won''t Do';
+----
+ENG-5
+
+query T
+SELECT query::JSON->>'jql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/search/jql') ORDER BY seq DESC LIMIT 1;
+----
+status = "Done" AND project = "ENG" AND resolution = "Won't Do" ORDER BY key ASC
+
+query T
+SELECT key FROM jira.main.issues() WHERE list_contains(labels, 'a"b\c') ;
+----
+
+query T
+SELECT query::JSON->>'jql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/search/jql') ORDER BY seq DESC LIMIT 1;
+----
+labels = "a\"b\\c" ORDER BY key ASC
+
+# OR is not translated (it is re-checked by the SDK instead).
+query T
+SELECT key FROM jira.main.issues() WHERE key = 'OPS-1' OR title = 'Search UI' ORDER BY key;
+----
+ENG-4
+OPS-1
+
+query T
+SELECT query::JSON->>'jql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/search/jql') ORDER BY seq DESC LIMIT 1;
+----
+created >= "1970-01-01" ORDER BY key ASC
+
+# The jql argument is ANDed with the pushed clauses and keeps its own ORDER BY.
+query T
+SELECT key FROM jira.main.issues(jql := 'summary ~ "search" ORDER BY created DESC') WHERE project_key = 'ENG';
+----
+ENG-4
+ENG-1
+
+query T
+SELECT query::JSON->>'jql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/search/jql') ORDER BY seq DESC LIMIT 1;
+----
+(summary ~ "search") AND project = "ENG" ORDER BY created DESC
+
+query T
+SELECT key FROM jira.main.issues(jql := 'sprint in openSprints() AND issuetype in subTaskIssueTypes()');
+----
+ENG-6
+
+# A bad JQL comes back as the server's 400.
+statement error
+SELECT count(*) FROM jira.main.issues(jql := 'project = ENG AND bogus = 1');
+----
+<REGEX>:.*HTTP 400.*bogus.*
+
+statement error
+SELECT count(*) FROM jira.main.issues(page_size := 500);
+----
+<REGEX>:.*page_size.*
+
+# nextPageToken paging: page_size 3 → 4 requests for 10 issues, all rows once.
+query II
+SELECT count(*), count(DISTINCT key) FROM jira.main.issues(jql := 'ORDER BY key', page_size := 3);
+----
+10	10
+
+query I
+SELECT count(*) FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/search/jql') WHERE query::JSON->>'maxResults' = '3';
+----
+4
+
+query I
+SELECT count(*) FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/search/jql') WHERE query::JSON->>'nextPageToken' IS NOT NULL AND query::JSON->>'maxResults' = '3';
+----
+3
+
+# ------------------------------------------------------------------ custom fields
+
+query TT
+SELECT key, custom_fields FROM jira.main.issues() WHERE key IN ('OPS-1', 'ENG-3') ORDER BY key;
+----
+ENG-3	{"Story point estimate":3,"Sprint":[{"id":2,"state":"active","name":"ENG Sprint 2","startDate":"2026-11-02T09:00:00.000Z","endDate":"2026-11-16T09:00:00.000Z","createdDate":"2026-10-28T09:00:00.000Z","originBoardId":1,"goal":"Ship search","boardId":1}]}
+OPS-1	{"Team":{"id":"opt-SRE","value":"SRE"},"Customer Tier":"Gold"}
+
+statement ok
+ATTACH 'jira' AS jh (TYPE vgi, LOCATION '{JIRA_WORKER}', custom_fields 'story_points=Story point estimate:DOUBLE, team=customfield_10030, tier=Customer Tier, sprints=Sprint:VARCHAR[]');
+
+query TRTTT
+SELECT key, story_points, team, tier, sprints FROM jh.main.issues() WHERE story_points >= 4 ORDER BY key;
+----
+ENG-2	5.0	NULL	NULL	[ENG Sprint 1, ENG Sprint 2]
+ENG-4	8.0	NULL	NULL	[ENG Sprint 3]
+
+query TT
+SELECT query::JSON->>'jql', query::JSON->>'fields' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/search/jql') ORDER BY seq DESC LIMIT 1;
+----
+cf[10016] >= 4 ORDER BY key ASC	key,customfield_10016,customfield_10030,customfield_10040,customfield_10020
+
+query TT
+SELECT key, team FROM jh.main.issues() WHERE team = 'SRE' ORDER BY key;
+----
+OPS-1	SRE
+OPS-2	SRE
+
+query T
+SELECT column_type FROM (DESCRIBE SELECT story_points FROM jh.main.issues());
+----
+DOUBLE
+
+statement ok
+DETACH jh;
+
+statement ok
+ATTACH 'jira' AS jbad (TYPE vgi, LOCATION '{JIRA_WORKER}', custom_fields 'x=No Such Field:DOUBLE');
+
+statement error
+SELECT x FROM jbad.main.issues();
+----
+<REGEX>:.*no Jira field named 'No Such Field'.*
+
+statement ok
+DETACH jbad;
+
+# ---------------------------------------------------------- per-issue collections
+
+query TTTTT
+SELECT history_id, field, from_string, to_string, changed_at FROM jira.main.issue_changelog(issue_key := 'ENG-2') ORDER BY changed_at, field;
+----
+30010	Sprint	(empty)	ENG Sprint 1	2026-09-12 10:00:00+00
+30010	assignee	NULL	Ada Lovelace	2026-09-12 10:00:00+00
+30011	status	To Do	In Progress	2026-09-15 09:00:00+00
+30012	status	In Progress	In Review	2026-10-01 12:00:00+00
+30013	status	In Review	In Progress	2026-10-03 12:00:00+00
+30014	status	In Progress	In Review	2026-10-08 12:00:00+00
+30015	status	In Review	Done	2026-10-10 16:30:00+00
+
+# The fixture caps changelog pages at 2 entries: 6 entries = 3 pages.
+query I
+SELECT count(*) FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/issue/ENG-2/changelog');
+----
+3
+
+# Cycle time: hours ENG-2 spent In Progress (two stints: 9/15→10/1 and 10/3→10/8).
+query R
+SELECT round(sum(datediff('second', changed_at::TIMESTAMP, next_at::TIMESTAMP)) / 3600, 1) FROM (SELECT changed_at, to_string, lead(changed_at) OVER (ORDER BY changed_at) AS next_at FROM jira.main.issue_changelog(issue_key := 'ENG-2') WHERE field = 'status') WHERE to_string = 'In Progress';
+----
+507.0
+
+# Without keys: every issue the JQL matches (WHERE issue_key IN … also selects issues).
+query TI
+SELECT issue_key, count(*) FROM jira.main.issue_changelog(jql := 'project = OPS') WHERE field = 'status' GROUP BY ALL ORDER BY 1;
+----
+OPS-1	2
+
+query TI
+SELECT issue_key, count(*) FROM jira.main.issue_changelog() WHERE issue_key IN ('ENG-1', 'ENG-3', 'NOPE-1') GROUP BY ALL ORDER BY 1;
+----
+ENG-1	1
+ENG-3	2
+
+query ITTTT
+SELECT id, author_display_name, replace(body, chr(10), ' | '), body_adf->>'type', visibility FROM jira.main.issue_comments(issue_key := 'ENG-1,ENG-3') ORDER BY id;
+----
+40001	Grace Hopper	Kick-off notes attached. @Ada Lovelace please review.	doc	NULL
+40002	Ada Lovelace	Looks good. | GET /search?q=	doc	NULL
+40010	Ada Lovelace	Stack trace in the attachment.	doc	role:Developers
+
+query TIT
+SELECT issue_key, count(*), bool_and(is_public) FROM jira.main.issue_comments() GROUP BY ALL ORDER BY 1;
+----
+ENG-1	2	true
+ENG-3	1	true
+OPS-2	1	false
+
+query TIT
+SELECT author_display_name, sum(time_spent_seconds), string_agg(comment, '; ' ORDER BY started_at) FROM jira.main.issue_worklogs(issue_key := 'ENG-2') GROUP BY ALL ORDER BY 1;
+----
+Ada Lovelace	10800	Schema design
+Grace Hopper	25200	Review + fixes
+
+query TR
+SELECT issue_key, sum(time_spent_seconds) / 3600.0 FROM jira.main.issue_worklogs(jql := 'project = ENG') GROUP BY ALL ORDER BY 1;
+----
+ENG-2	10.0
+ENG-3	1.0
+
+query TTTTTTTT
+SELECT issue_key, link_id, link_type, direction, relationship, linked_issue_key, linked_issue_status, linked_issue_type FROM jira.main.issue_links() ORDER BY issue_key;
+----
+ENG-3	20001	Blocks	outward	blocks	ENG-4	To Do	Story
+ENG-4	20001	Blocks	inward	is blocked by	ENG-3	In Review	Bug
+ENG-5	20002	Relates	outward	relates to	OPS-2	In Progress	Task
+OPS-2	20002	Relates	inward	relates to	ENG-5	Done	Bug
+
+query T
+SELECT linked_issue_key FROM jira.main.issue_links() WHERE issue_key = 'ENG-4';
+----
+ENG-3
+
+query T
+SELECT query::JSON->>'jql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/search/jql') ORDER BY seq DESC LIMIT 1;
+----
+key in ("ENG-4") ORDER BY key ASC
+
+# ------------------------------------------------------------------- projects
+
+query TTTTTTTT
+SELECT id, key, name, project_type, style, category, lead_display_name, is_private FROM jira.main.projects ORDER BY key;
+----
+10000	ENG	Engineering	software	classic	Product	Ada Lovelace	false
+10001	OPS	Operations	business	next-gen	NULL	Grace Hopper	true
+
+query T
+SELECT name FROM jira.main.projects WHERE key = 'OPS';
+----
+Operations
+
+query T
+SELECT query::JSON->>'keys' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/project/search') ORDER BY seq DESC LIMIT 1;
+----
+OPS
+
+query TTTT
+SELECT project_key, name, lead_display_name, assignee_type FROM jira.main.components() ORDER BY name;
+----
+ENG	Backend	Ada Lovelace	COMPONENT_LEAD
+ENG	Frontend	Grace Hopper	PROJECT_DEFAULT
+
+query TTTTT
+SELECT project_key, name, released, archived, release_date FROM jira.main.versions(project_key := 'ENG') ORDER BY name;
+----
+ENG	0.9	true	false	2026-08-01
+ENG	1.0	false	false	2026-12-01
+
+query I
+SELECT count(*) FROM jira.main.versions() WHERE project_key = 'NOPE';
+----
+0
+
+query TT
+SELECT status, status_category_key FROM jira.main.project_statuses(project_key := 'ENG') WHERE issue_type = 'Bug' ORDER BY status;
+----
+Done	done
+In Progress	indeterminate
+In Review	indeterminate
+To Do	new
+
+query TI
+SELECT project_key, count(*) FROM jira.main.project_statuses() GROUP BY ALL ORDER BY 1;
+----
+ENG	17
+OPS	3
+
+# ---------------------------------------------------------------------- agile
+
+query ITTTT
+SELECT id, name, type, project_key, project_name FROM jira.main.boards ORDER BY id;
+----
+1	ENG Scrum	scrum	ENG	Engineering
+2	OPS Kanban	kanban	OPS	Operations
+
+query T
+SELECT name FROM jira.main.boards WHERE type = 'kanban';
+----
+OPS Kanban
+
+query T
+SELECT query::JSON->>'type' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/agile/1.0/board') ORDER BY seq DESC LIMIT 1;
+----
+kanban
+
+# Kanban boards (400 "does not support sprints") contribute no rows.
+query IITTTTT
+SELECT board_id, id, name, state, goal, start_at, complete_at FROM jira.main.sprints() ORDER BY id;
+----
+1	1	ENG Sprint 1	closed	Index MVP	2026-09-14 09:00:00+00	2026-09-28 10:00:00+00
+1	2	ENG Sprint 2	active	Ship search	2026-11-02 09:00:00+00	NULL
+1	3	ENG Sprint 3	future	(empty)	NULL	NULL
+
+query T
+SELECT name FROM jira.main.sprints(board_id := 1) WHERE state = 'active';
+----
+ENG Sprint 2
+
+query T
+SELECT query::JSON->>'state' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/agile/1.0/board/1/sprint') ORDER BY seq DESC LIMIT 1;
+----
+active
+
+# A sprint's issues and how many are done.
+query II
+SELECT count(*) FILTER (WHERE state = 'closed'), count(*) FROM jira.main.issues() WHERE list_contains(sprint_ids, (SELECT id FROM jira.main.sprints(board_id := 1) WHERE state = 'active'));
+----
+1	3
+
+# ------------------------------------------------------------------- site metadata
+
+# The fixture returns at most 2 users per page: paging continues to an empty page.
+query TTTTT
+SELECT account_id, display_name, email_address, active, account_type FROM jira.main.users ORDER BY account_id;
+----
+acc-ada	Ada Lovelace	ada@example.com	true	atlassian
+acc-bot	Automation for Jira	NULL	true	app
+acc-grace	Grace Hopper	NULL	true	atlassian
+acc-linus	Linus Torvalds	NULL	false	atlassian
+
+query TTTTI
+SELECT name, id, schema_type, schema_custom, custom_id FROM jira.main.fields WHERE is_custom ORDER BY name;
+----
+Customer Tier	customfield_10040	string	com.atlassian.jira.plugin.system.customfieldtypes:textfield	10040
+Sprint	customfield_10020	array	com.pyxis.greenhopper.jira:gh-sprint	10020
+Story point estimate	customfield_10016	number	com.atlassian.jira.plugin.system.customfieldtypes:float	10016
+Team	customfield_10030	option	com.atlassian.jira.plugin.system.customfieldtypes:select	10030
+
+# /status answers 503 (Retry-After: 1) once and /priority 429 once: both retried.
+query TTT
+SELECT name, status_category, status_category_key FROM jira.main.statuses ORDER BY name;
+----
+Done	Done	done
+In Progress	In Progress	indeterminate
+In Review	In Progress	indeterminate
+To Do	To Do	new
+
+query TT
+SELECT id, name FROM jira.main.priorities ORDER BY id;
+----
+1	Highest
+2	High
+3	Medium
+4	Low
+5	Lowest
+
+query I
+SELECT count(*) FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/rest/api/3/priority');
+----
+2
+
+query TTI
+SELECT name, is_subtask, hierarchy_level FROM jira.main.issue_types ORDER BY hierarchy_level DESC, name;
+----
+Epic	false	1
+Bug	false	0
+Story	false	0
+Task	false	0
+Sub-task	true	-1
+
+# ------------------------------------------- UNION with GitHub/GitLab-shaped issues
+
+query TITTT
+SELECT repo, number, title, state, user_login FROM jira.main.issues() WHERE key = 'OPS-2'
+UNION ALL
+SELECT 'octo/repo', 7::BIGINT, 'From GitHub', 'open', 'octocat'
+ORDER BY repo;
+----
+OPS	2	Investigate 'disk full' alerts	open	acc-bot
+octo/repo	7	From GitHub	open	octocat
+
+# ======================================================================= Confluence
+
+query TTTTT
+SELECT id, key, name, type, status FROM jira.confluence.spaces ORDER BY id;
+----
+65537	ENG	Engineering	global	current
+65538	OPS	Operations	global	current
+65539	~ada	Ada Lovelace	personal	current
+65540	OLD	Old wiki	global	archived
+
+query T
+SELECT key FROM jira.confluence.spaces WHERE key IN ('ENG', 'OPS') AND status = 'current' ORDER BY key;
+----
+ENG
+OPS
+
+query TT
+SELECT query::JSON->>'keys', query::JSON->>'status' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/wiki/api/v2/spaces') ORDER BY seq DESC LIMIT 1;
+----
+ENG,OPS	current
+
+query TTTTTTIT
+SELECT id, type, title, space_key, labels, parent_id, version, author_display_name FROM jira.confluence.pages() ORDER BY id;
+----
+1000	page	Engineering Home	ENG	[]	NULL	1	Ada Lovelace
+1001	page	Search architecture	ENG	[architecture, search]	1000	3	Ada Lovelace
+1010	page	Operations Home	OPS	[]	NULL	1	Grace Hopper
+1011	page	Runbook: Rotate certificates	OPS	[runbook]	1010	2	Grace Hopper
+1012	page	Runbook: Disk full	OPS	[runbook, incident]	1010	1	Ada Lovelace
+1013	blogpost	Postmortem: October outage	OPS	[postmortem]	NULL	1	Grace Hopper
+
+query T
+SELECT title FROM jira.confluence.pages() WHERE space_key = 'OPS' AND list_contains(labels, 'runbook') ORDER BY title;
+----
+Runbook: Disk full
+Runbook: Rotate certificates
+
+query TT
+SELECT query::JSON->>'cql', query::JSON->>'expand' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/wiki/rest/api/search') ORDER BY seq DESC LIMIT 1;
+----
+type in (page, blogpost) AND space = "OPS" AND label = "runbook" ORDER BY id ASC	content.metadata.labels,content.space
+
+query T
+SELECT title FROM jira.confluence.pages() WHERE type = 'blogpost';
+----
+Postmortem: October outage
+
+query T
+SELECT query::JSON->>'cql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/wiki/rest/api/search') ORDER BY seq DESC LIMIT 1;
+----
+type = "blogpost" ORDER BY id ASC
+
+query T
+SELECT title FROM jira.confluence.pages() WHERE last_modified_at >= TIMESTAMPTZ '2026-10-14 09:00:00+00' ORDER BY title;
+----
+Postmortem: October outage
+Runbook: Disk full
+Search architecture
+
+query T
+SELECT query::JSON->>'cql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/wiki/rest/api/search') ORDER BY seq DESC LIMIT 1;
+----
+type in (page, blogpost) AND lastmodified >= "2026-10-13 07:00" ORDER BY id ASC
+
+# Bodies are fetched only when selected; storage XHTML → text keeps lists, tables, macros.
+query TT
+SELECT replace(replace(body_text, chr(10), ' | '), chr(9), ' ~ '), body_storage LIKE '<h1>Overview</h1>%' FROM jira.confluence.pages() WHERE id = '1001';
+----
+Overview | The indexer & query API. | - Indexer | - Query <API> | Part ~ Owner | Indexer ~ @acc-ada | GET /search	true
+
+query T
+SELECT query::JSON->>'expand' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/wiki/rest/api/search') ORDER BY seq DESC LIMIT 1;
+----
+content.body.storage
+
+query T
+SELECT title FROM jira.confluence.pages(cql := 'text ~ "deploy"') WHERE type = 'page' ORDER BY title;
+----
+Runbook: Disk full
+Runbook: Rotate certificates
+
+query T
+SELECT query::JSON->>'cql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/cloud/wiki/rest/api/search') ORDER BY seq DESC LIMIT 1;
+----
+(text ~ "deploy") AND type = "page" ORDER BY id ASC
+
+statement error
+SELECT count(*) FROM jira.confluence.pages(cql := 'nosuchfield = 1');
+----
+<REGEX>:.*HTTP 400.*
+
+query ITTT
+SELECT number, message, minor_edit, author_id FROM jira.confluence.page_versions(page_id := '1001') ORDER BY number;
+----
+1	First draft	false	acc-ada
+2	(empty)	true	acc-ada
+3	Add owner table	false	acc-grace
+
+query TT
+SELECT page_id, name FROM jira.confluence.page_labels() WHERE page_id IN ('1001', '1012') ORDER BY 1, 2;
+----
+1001	architecture
+1001	search
+1012	incident
+1012	runbook
+
+query TI
+SELECT name, count(*) FROM jira.confluence.page_labels() GROUP BY name ORDER BY 2 DESC, 1 LIMIT 1;
+----
+runbook	2
+
+query TTTTTT
+SELECT id, kind, author_id, body_text, resolution_status, inline_selection FROM jira.confluence.page_comments(page_id := '1001') ORDER BY id;
+----
+c-1	footer	acc-grace	Where does the ranking live?	NULL	NULL
+c-2	inline	acc-linus	Is this REST or gRPC?	open	query API
+c-3	inline	acc-ada	Renamed.	resolved	Indexer
+
+query I
+SELECT count(*) FROM jira.confluence.page_comments();
+----
+3
+
+query I
+SELECT count(*) FROM jira.confluence.page_versions(page_id := '999999');
+----
+0
+
+statement ok
+DROP SECRET cloud;
+
+# ================================================================= OAuth gateway
+
+statement ok
+CREATE SECRET oauth (TYPE atlassian, SITE_URL '{JIRA_FIXTURE_URL}/cloud', OAUTH_ACCESS_TOKEN 'oauth-token', CLOUD_ID '11111111-2222-3333-4444-555555555555', API_GATEWAY_URL '{JIRA_FIXTURE_URL}/gw', DEPLOYMENT 'cloud');
+
+# Requests go through the gateway; links still point at the site.
+query TT
+SELECT key, html_url = '{JIRA_FIXTURE_URL}/cloud/browse/ENG-1' FROM jira.main.issues() WHERE key = 'ENG-1';
+----
+ENG-1	true
+
+query T
+SELECT auth FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/gw/ex/jira/11111111-2222-3333-4444-555555555555/rest/api/3/search/jql') ORDER BY seq DESC LIMIT 1;
+----
+Bearer
+
+query T
+SELECT key FROM jira.confluence.spaces WHERE key = 'OPS';
+----
+OPS
+
+statement ok
+DROP SECRET oauth;
+
+# ============================================================ Jira Data Center (v2)
+
+statement ok
+CREATE SECRET dc (TYPE atlassian, SITE_URL '{JIRA_FIXTURE_URL}/dc', PERSONAL_ACCESS_TOKEN 'dc-pat');
+
+query TTTTTTTT
+SELECT key, title, state, user_login, assignee, replace(body, chr(10), ' | '), description_adf, sprint_names FROM jira.main.issues() ORDER BY key;
+----
+LEG-1	Migrate cron jobs	open	mjones	jsmith	h1. Plan | * move to *k8s*	NULL	[LEG Sprint 7]
+LEG-2	Remove dead code	closed	jsmith	mjones	NULL	NULL	[]
+LEG-3	Login page 500s	open	mjones	NULL	Seen after the 9.12 upgrade.	NULL	[]
+
+query T
+SELECT query::JSON->>'jql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/dc/rest/api/2/search') ORDER BY seq DESC LIMIT 1;
+----
+created >= "1970-01-01" ORDER BY key ASC
+
+query T
+SELECT key FROM jira.main.issues() WHERE list_contains(labels, 'infra') AND assignee IS NULL;
+----
+LEG-3
+
+query T
+SELECT query::JSON->>'jql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/dc/rest/api/2/search') ORDER BY seq DESC LIMIT 1;
+----
+labels = "infra" AND assignee is EMPTY ORDER BY key ASC
+
+# Data Center's parent covers sub-tasks only: parent_key is not pushed (no rows lost).
+query I
+SELECT count(*) FROM jira.main.issues() WHERE parent_key = 'LEG-1';
+----
+0
+
+query T
+SELECT query::JSON->>'jql' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/dc/rest/api/2/search') ORDER BY seq DESC LIMIT 1;
+----
+created >= "1970-01-01" ORDER BY key ASC
+
+# Changelog comes from search with expand=changelog on Data Center.
+query TTTTT
+SELECT issue_key, author, field, from_string, to_string FROM jira.main.issue_changelog() ORDER BY 1, 3;
+----
+LEG-1	jsmith	status	To Do	In Progress
+LEG-2	mjones	resolution	NULL	Done
+LEG-2	mjones	status	To Do	Done
+
+query T
+SELECT query::JSON->>'expand' FROM read_json('{JIRA_FIXTURE_URL}/__requests?path=/dc/rest/api/2/search') ORDER BY seq DESC LIMIT 1;
+----
+changelog
+
+query TTT
+SELECT issue_key, author, body FROM jira.main.issue_comments(issue_key := 'LEG-1');
+----
+LEG-1	mjones	Please do the *batch* jobs first.
+
+query TT
+SELECT key, lead FROM jira.main.projects;
+----
+LEG	jsmith
+
+query TTT
+SELECT account_id, name, email_address FROM jira.main.users ORDER BY 1;
+----
+JIRAUSER10000	jsmith	jsmith@corp.example
+JIRAUSER10001	mjones	mjones@corp.example
+
+statement ok
+DROP SECRET dc;
+
+# Basic auth (username + password) also works on Data Center, with deployment forced.
+statement ok
+CREATE SECRET dc_basic (TYPE atlassian, SITE_URL '{JIRA_FIXTURE_URL}/dc', EMAIL 'jsmith', API_TOKEN 'dc-password', DEPLOYMENT 'datacenter');
+
+query I
+SELECT count(*) FROM jira.main.issues() WHERE state = 'open';
+----
+2
+
+statement ok
+DROP SECRET dc_basic;
