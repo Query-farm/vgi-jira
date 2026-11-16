@@ -1,5 +1,5 @@
 {
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "type": "module",
   "description": "Atlassian Jira (Cloud and Data Center) and Confluence Cloud as SQL tables in DuckDB, with JQL/CQL pushdown.",
