@@ -91,23 +91,20 @@ export const CATALOG_COMMENT =
 
 export const CATALOG_DOC_LLM =
   "Read-only SQL access to Atlassian Jira (Cloud REST v3 or Data Center REST v2, detected automatically) " +
-  "and Confluence Cloud. Schema `main` is Jira: issues(jql := …) runs a JQL search, and WHERE filters on " +
-  "project/repo, key, id, status, status_category, state, issue_type, is_subtask, priority, resolution, " +
-  "assignee, user_login (reporter), labels/components/fix_versions/sprint_ids (list_contains), " +
-  "parent_key and created_at/updated_at/closed_at ranges are translated into JQL and ANDed with the " +
-  "jql argument; only the projected columns are requested via the fields parameter. Issue columns " +
-  "align with the GitHub and GitLab workers (repo, number, title, state 'open'/'closed', user_login, " +
-  "assignees, labels, body, html_url, created_at, updated_at, closed_at) so issues UNION across " +
-  "trackers. Custom fields come back as a JSON map keyed by field name (custom_fields) and can be " +
-  "hoisted into typed columns with the ATTACH option custom_fields 'col=Field Name:TYPE, …'. " +
-  "issue_changelog gives field-level history (WHERE field = 'status' for transitions and cycle " +
-  "time); issue_comments, issue_worklogs and issue_links take issue_key = / IN or a jql argument. " +
-  "Also projects, components, versions, project_statuses, boards, sprints, users, fields, statuses, " +
-  "priorities and issue_types. Schema `confluence` covers spaces, pages(cql := …) with CQL pushdown " +
-  "(space_key, type, labels, title, created_at, last_modified_at), page bodies as storage XHTML " +
-  "and plain text, page_versions, page_labels and page_comments. Every object needs an `atlassian` " +
-  "secret: SITE_URL plus EMAIL + API_TOKEN (Cloud), PERSONAL_ACCESS_TOKEN (Data Center) or " +
-  "OAUTH_ACCESS_TOKEN (+ CLOUD_ID). 429 Retry-After / X-RateLimit headers are honoured. Docs: " +
+  "and Confluence Cloud. Reach for it to analyse issue tracking and agile delivery (backlogs, status " +
+  "transitions and cycle time, sprints, workload, time logged) or to search and read wiki content. " +
+  "Schema `main` is Jira: the issue search runs JQL, and WHERE filters on project, key, status, type, " +
+  "priority, resolution, people, labels/components/fix versions/sprints (list_contains), parent and " +
+  "created/updated/closed ranges are translated into JQL and ANDed with an explicit jql argument; only " +
+  "the projected columns are requested. Issue columns align with the GitHub and GitLab workers (repo, " +
+  "number, title, state 'open'/'closed', user_login, assignees, labels, body, html_url, timestamps) so " +
+  "issues UNION across trackers. Custom fields come back as a JSON map keyed by field name and can be " +
+  "hoisted into typed columns with the ATTACH option custom_fields 'col=Field Name:TYPE, …'. Per-issue, " +
+  "per-project and per-board collections take their parent key as a filter or argument and otherwise " +
+  "fan out over every parent. Schema `confluence` covers spaces and pages with CQL pushdown, page " +
+  "bodies as storage XHTML and plain text, and per-page history, labels and comments. Every object " +
+  "needs an `atlassian` secret: SITE_URL plus EMAIL + API_TOKEN (Cloud), PERSONAL_ACCESS_TOKEN (Data " +
+  "Center) or OAUTH_ACCESS_TOKEN (+ CLOUD_ID). 429 Retry-After / X-RateLimit headers are honoured. Docs: " +
   "https://developer.atlassian.com/cloud/jira/platform/rest/v3/intro/ ; " +
   "https://developer.atlassian.com/cloud/confluence/rest/v2/intro/ .";
 
@@ -123,12 +120,14 @@ export const CATALOG_DOC_MD =
 
 export const SCHEMA_DOC_LLM =
   "Jira as SQL. issues(jql := NULL, page_size := 100) is the main entry point: WHERE filters push " +
-  "into JQL (ANDed with jql), projection picks the fields= list. Per-issue collections " +
-  "(issue_changelog, issue_comments, issue_worklogs, issue_links) take issue_key = / IN or jql := and " +
-  "otherwise read every issue the JQL matches. Per-project collections (components, versions, " +
-  "project_statuses) take project_key; sprints take board_id; otherwise they fan out over every " +
-  "project / board. projects, boards, users, fields, statuses, priorities and issue_types are " +
-  "plain listings. Users are identified by accountId on Cloud and by username on Data Center.";
+  "into JQL (ANDed with jql), projection picks the fields= list. Per-issue collections (history, " +
+  "comments, worklogs, links) take issue_key = / IN or jql := and otherwise read every issue the JQL " +
+  "matches. Per-project collections take project_key and sprints take board_id; otherwise they fan " +
+  "out over every project / board. Site-wide configuration listings are " +
+  "unfiltered. Users are identified by accountId on Cloud and by username on Data Center.";
+
+export const SCHEMA_COMMENT =
+  "Jira issues with SQL-to-JQL pushdown, their history and work, projects, boards and sprints.";
 
 export const SCHEMA_DOC_MD =
   "## main (Jira)\n\n" +
@@ -137,11 +136,13 @@ export const SCHEMA_DOC_MD =
   "All objects need an `atlassian` secret.";
 
 export const CONFLUENCE_DOC_LLM =
-  "Confluence Cloud as SQL. spaces lists spaces (v2 API). pages(cql := NULL) searches pages and blog " +
-  "posts with CQL (v1 search): WHERE space_key / type / title / labels (list_contains) / created_at / " +
-  "last_modified_at / id push into CQL, ANDed with cql; the storage body and plain-text body are " +
-  "fetched only when selected. page_versions, page_labels and page_comments take page_id (named " +
-  "argument or = / IN filter).";
+  "Confluence Cloud as SQL. Spaces come from the v2 API. The page search covers pages and blog posts " +
+  "with CQL (v1 search): WHERE space_key / type / title / labels (list_contains) / created_at / " +
+  "last_modified_at / id push into CQL, ANDed with an explicit cql argument; the storage body and " +
+  "plain-text body are fetched only when selected. Per-page collections (version history, labels, " +
+  "comments) take page_id as a named argument or an = / IN filter.";
+
+export const CONFLUENCE_COMMENT = "Confluence Cloud spaces and pages with SQL-to-CQL pushdown.";
 
 export const CONFLUENCE_DOC_MD =
   "## confluence\n\n" +

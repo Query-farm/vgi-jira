@@ -12,9 +12,9 @@ import {
   CATALOG_COMMENT,
   CATALOG_NAME,
   CATALOG_TAGS,
-  CONFLUENCE_DOC_MD,
+  CONFLUENCE_COMMENT,
   CONFLUENCE_SCHEMA_TAGS,
-  SCHEMA_DOC_MD,
+  SCHEMA_COMMENT,
   SCHEMA_TAGS,
   SOURCE_URL,
 } from "./meta.ts";
@@ -115,14 +115,14 @@ export const CATALOG: CatalogDescriptor = {
   schemas: [
     {
       path: ["main"],
-      comment: SCHEMA_DOC_MD,
+      comment: SCHEMA_COMMENT,
       functions: FUNCTIONS,
       tables: JIRA_TABLES,
       tags: { ...SCHEMA_TAGS, "vgi.example_queries": JSON.stringify(JIRA_EXAMPLES.slice(0, 12)) },
     },
     {
       path: ["confluence"],
-      comment: CONFLUENCE_DOC_MD,
+      comment: CONFLUENCE_COMMENT,
       functions: CONFLUENCE_FUNCTIONS,
       tables: CONFLUENCE_TABLES,
       tags: { ...CONFLUENCE_SCHEMA_TAGS, "vgi.example_queries": JSON.stringify(CONFLUENCE_EXAMPLES) },
